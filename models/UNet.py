@@ -63,9 +63,6 @@ class Up(nn.Module):
 
         x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
                         diffY // 2, diffY - diffY // 2])
-        # if you have padding issues, see
-        # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
-        # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
@@ -86,7 +83,6 @@ class UNet(nn.Module):
     def __init__(self, n_channels, days_out=1, bilinear=False, kernel_size=3):
         super(UNet, self).__init__()
         self.n_channels = n_channels
-        #self.n_classes = n_classes
         self.bilinear = bilinear
 
         self.inc = (DoubleConv(n_channels, 64, kernel_size))
@@ -99,31 +95,19 @@ class UNet(nn.Module):
         self.up2 = (Up(512, 256 // factor, kernel_size, bilinear))
         self.up3 = (Up(256, 128 // factor, kernel_size, bilinear))
         self.up4 = (Up(128, 64, kernel_size, bilinear))
-        #self.outc = (OutConv(64, n_classes))
         self.outc = (OutConv(64, days_out))
 
     def forward(self, x):
-        #print("x shape 1: ", x.shape)
         x1 = self.inc(x)
-        #print("x shape 2: ", x1.shape)
         x2 = self.down1(x1)
-        #print("x shape 3: ", x2.shape)
         x3 = self.down2(x2)
-        #print("x shape 4: ", x3.shape)
         x4 = self.down3(x3)
-        #print("x shape 5: ", x4.shape)
         x5 = self.down4(x4)
-        #print("x shape 6: ", x5.shape)
         x = self.up1(x5, x4)
-        #print("x shape 7: ", x.shape)
         x = self.up2(x, x3)
-        #print("x shape 8: ", x.shape)
         x = self.up3(x, x2)
-        #print("x shape 9: ", x.shape)
         x = self.up4(x, x1)
-        #print("x shape 10: ", x.shape)
         logits = self.outc(x)
-        #print("x shape 11: ", logits.shape)
 
         return logits
 

@@ -1,25 +1,26 @@
 import torch
 from torch import nn
 from TorchDiffEqPack import odesolve_adjoint_sym12, odesolve
-from models.UNet import UNet
-# from models.MotionRNN import RNN, Warp
-from models.IAM4VP import IAM4VP
-from models.DMVFN import DMVFN
+from UNet import UNet
+from rUNet import rUNet
+from DMVFN import DMVFN
+from IAM4VP import IAM4VP
+# from MotionRNN import RNN, Warp
 
 
 class Cell(nn.Module):
     '''base class for picture two picture models'''
     def __init__(self, **kwargs) -> None:
         super().__init__()
-
+        
     def init(self, m):
-        return m,
+        return m, 
 
 class Pers(Cell):
     '''persistent cell'''
     def __init__(self, **kwargs) -> None:
         super().__init__()
-
+        
         self.smth = Conv(1, 1, 1, **kwargs)
     def forward(self, inputs, *args, **kwargs):
         return inputs, *args
@@ -28,7 +29,7 @@ class NaiveGate(nn.Module):
     '''class for binary two pictures merge'''
     def __init__(self):
         super().__init__()
-
+        
     def forward(self, input, state):
         gate = input[:,:1] > 0
         out = [input[:,:1] * gate + state[:,:1] * (~gate)]
@@ -43,14 +44,14 @@ class Seq2seq(nn.Module):
     y:        i_w   e_w
                |    /
            c - c - c
-         / |   |
-    X:  1 w_w i_w
+         / |   |     
+    X:  1 w_w i_w    
     with 'b' for starting baseline and args:
         cell : image to image model 'c'
-        w_w : warming window
-        i_w : interpolation window
-        e_w : extrapolation window
-
+        w_w : warming window 
+        i_w : interpolation window 
+        e_w : extrapolation window 
+        
     returns (interpolated, extrapolated)
     """
     def __init__(self, ingate: nn.Module = None, model: nn.Module = None, outgate: nn.Module = None,
@@ -59,34 +60,34 @@ class Seq2seq(nn.Module):
         self.ingate = ingate or NaiveGate()
         self.model = model or Pers()
         self.outgate = outgate or nn.Identity()
-
+        
         self.w_w = w_w
         self.i_w = i_w
         self.e_w = e_w
         self.starter = starter
         self.scale = scale
-
+    
     def forward(self, inputs):
         """inputs shape BTCHW"""
         m, *args = self.model.init(inputs[:,0])
-
+        
         # warm
         for i in range(self.w_w):
             m, *args = self.model(m, *args)
             m = self.ingate(inputs[:, 1 + i], m)
-
+        
         outputs = []
         # interpolate
         for i in range(self.i_w):
             m, *args = self.model(m, *args)
             outputs.append(self.outgate(m)[:,0])
             m = self.ingate(inputs[:, 1 + self.w_w + i], m)
-
+            
         # extrapolate
         for i in range(self.e_w):
             m, *args = self.model(m, *args)
             outputs.append(self.outgate(m)[:,0])
-
+            
         return torch.stack(outputs).transpose(0, 1).contiguous()
 
 class FUNet(nn.Module):
@@ -94,7 +95,7 @@ class FUNet(nn.Module):
                 w_w=None, i_w=None, e_w=None, starter=None, scale=1, **kwargs):
         super().__init__()
         self.model = UNet(channels*(1+w_w+i_w), i_w+e_w, bilinear, kernel_size)
-
+        
         self.w_w = w_w
         self.i_w = i_w
         self.e_w = e_w
@@ -105,11 +106,24 @@ class FUNet(nn.Module):
         b, t, c, h, w = inputs.shape
         return self.model(inputs.view(b,t*c,h,w)) #+ inputs[:,[t-1],0]
 
-
 # scaling models
-def interpolate(inputs, scale_factor):
-    return torch.nn.functional.interpolate(inputs,
-        scale_factor=(scale_factor,scale_factor), mode='bilinear', align_corners=True)
+def interpolate(inputs, scale=None, size=None):
+    in_shape = inputs.shape
+    if scale:
+        outputs = torch.nn.functional.interpolate(inputs, 
+            # scale_factor=(scale,scale), mode='bilinear' if scale > 1 else 'nearest')
+            scale_factor=(scale,scale), mode='bilinear')
+        h, w = outputs.shape[-2:]
+        outputs = outputs[...,:h//2*2,:w//2*2]
+    else:
+        if len(in_shape) == 3:
+            inputs = inputs[:,None]
+        outputs = torch.nn.functional.interpolate(inputs, 
+            # size=size, mode='bilinear' if size[0] > in_shape[-2] else 'nearest')
+            size=size, mode='bilinear')
+        if len(in_shape) == 3:
+            outputs = outputs[:,0]
+    return outputs
 
 class DU(Cell):
     '''Downsampling wrapper for cells'''
@@ -121,11 +135,29 @@ class DU(Cell):
     def init(self, inputs):
         m, *args = self.model.init(interpolate(inputs, 1/self.scale_factor))
         return interpolate(m, self.scale_factor), *args
-
+        
     def forward(self, inputs, *args):
         inputs = interpolate(inputs, 1/self.scale_factor)
         outputs, *args = self.model(inputs, *args)
         outputs = interpolate(outputs, self.scale_factor)
+        return outputs, *args
+
+class DU2(Cell):
+    '''Downsampling wrapper for cells'''
+    def __init__(self, model: Cell, size):
+        super().__init__()
+        self.model = model
+        self.size = size
+
+    def init(self, inputs):
+        m, *args = self.model.init(interpolate(inputs, size=self.size))
+        return interpolate(m, self.scale_factor), *args
+        
+    def forward(self, inputs, *args):
+        in_shape = inputs.shape
+        inputs = interpolate(inputs, size=self.size)
+        outputs, *args = self.model(inputs, *args)
+        outputs = interpolate(outputs, size=(in_shape[-2], in_shape[-1]))
         return outputs, *args
 
 class S2SDU(nn.Module):
@@ -138,16 +170,38 @@ class S2SDU(nn.Module):
         self.i_w = model.i_w
         self.e_w = model.e_w
         self.starter = model.starter
-
+        
     def forward(self, inputs):
         b,t,c,h1,w1 = inputs.shape
         inputs = interpolate(inputs.view(b*t,c,h1,w1), 1/self.scale_factor)
         _,_,h2,w2 = inputs.shape
         outputs = self.model(inputs.view(b,t,c,h2,w2))
-
+        
         b,t,h2,w2 = outputs.shape
         outputs = interpolate(outputs.view(b*t,1,h2,w2), self.scale_factor)
         _,_,h1,w1 = outputs.shape
+        return outputs.view(b,t,h1,w1)
+
+class S2SDU2(nn.Module):
+    '''Doensampling wrapper for seq2seq models'''
+    def __init__(self, model, size):
+        super().__init__()
+        self.model = model
+        self.size = size
+        self.w_w = model.w_w
+        self.i_w = model.i_w
+        self.e_w = model.e_w
+        self.starter = model.starter
+        
+    def forward(self, inputs):
+        b,t,c,h1,w1 = inputs.shape
+        inputs = interpolate(inputs.view(b*t,c,h1,w1), size=self.size)
+        _,_,h2,w2 = inputs.shape
+        outputs = self.model(inputs.view(b,t,c,h2,w2))
+        
+        b,t,h2,w2 = outputs.shape
+        outputs = interpolate(outputs.view(b*t,1,h2,w2), size=(h1,w1))
+        # _,_,h1,w1 = outputs.shape
         return outputs.view(b,t,h1,w1)
 
 
@@ -156,23 +210,23 @@ class CCell(Cell):
     def __init__(self, channels, **kwargs) -> None:
         super().__init__()
         self.channels = channels
-
+        
     def init(self, m):
         b, c, h, w = m.shape
         dc = self.channels - c
-        if dc > 0:
+        if dc > 0: 
             m = torch.cat((m, torch.zeros(b, dc, h, w, device=m.device)), 1)
-        return m,
+        return m, 
 
 def Conv(*args, **kwargs):
     wn = kwargs.pop('wn', False)
     bn = kwargs.pop('bn', True)
     bias = kwargs.pop('bias', True)
-
+    
     conv = nn.Conv2d(*args, bias=bias, **kwargs)
     if wn: conv.weight.data.fill_(0)
     if bias and bn: conv.bias.data.fill_(0)
-
+        
     return conv
 
 class Lin(CCell):
@@ -182,6 +236,11 @@ class Lin(CCell):
 
     def forward(self, inputs, *args):
         return self.neck(inputs), *args
+
+class RUNet(Lin):
+    def __init__(self, channels, bilinear=False, kernel_size=3):
+        super().__init__(channels)
+        self.neck = rUNet(channels, bilinear, kernel_size)
 
 def DoubleConv(channels_in, channels_out, dropout=0, kernel=3, **kwargs):
     """Return elementary U-Net block"""
@@ -233,14 +292,14 @@ class E(Cell): # TODO
 
     def init(self, m):
         return self.model.init(m)
-
+    
     def forward(self, inputs, *args):
         m = inputs
         for _ in range(self.steps):
             mm, *args = self.model(m, *args)
             m = m + mm/self.steps
         return m, *args
-
+        
 class ODEfnWrapper(nn.Module):
     def __init__(self, model: nn.Module, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -251,14 +310,14 @@ class ODEfnWrapper(nn.Module):
         return m
 
 class MALI(Cell):
-    options = {'method': 'sym12async', 'h': 0.1, 't0': 0.0, 't1': 1.0, 't_eval':None, 'print_neval': False,
+    options = {'method': 'sym12async', 'h': 0.1, 't0': 0.0, 't1': 1.0, 't_eval':None, 'print_neval': False, 
                'neval_max': 100000, 'interpolation_method':'linear', 'regenerate_graph':False}
-
+    
     def __init__(self, model: nn.Module, tol=1e-2, *args, **kwargs) -> None:
         super().__init__()
         self.model = ODEfnWrapper(model)
         self.options.update({'rtol': tol, 'atol': tol})
-
+        
     def init(self, m):
         return self.model.model.init(m)
 
@@ -272,16 +331,16 @@ class ConvGRU(nn.Module):
         if not hidden_dim: hidden_dim = input_dim
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.conv_gates = Conv(input_dim + hidden_dim, 2*hidden_dim, kernel, 1, (kernel-1)//2, bias=bias)
+        self.conv_gates = Conv(input_dim + hidden_dim, 2*hidden_dim, kernel, 1, (kernel-1)//2, bias=bias)  
         self.conv_can = Conv(input_dim + hidden_dim, hidden_dim, kernel, 1, (kernel-1)//2, bias=bias)
-
+    
     def forward(self, input_tensor, h_cur):
         combined = torch.sigmoid(self.conv_gates(torch.cat([input_tensor, h_cur], dim=1)))
         reset_gate, update_gate = torch.split(combined, self.hidden_dim, dim=1)
         cnm = torch.tanh(self.conv_can(torch.cat([input_tensor, reset_gate * h_cur], dim=1)))
         h_next = (1 - update_gate) * h_cur + update_gate * cnm
         return h_next
-
+        
 class LatentODE(Lin):
     def __init__(self, ch) -> None:
         super().__init__(ch)
@@ -323,7 +382,7 @@ class VidODE(Seq2seq):
         b,t,c,h,w = inputs.shape
         # encoding
         embs = self.encoder(inputs.view(b*t,c,h,w)).view(b,t,-1,h//4,w//4)
-
+        
         # latent dynamic:
         #  warm
         m = self.ingate(embs[:, 0], 0*embs[:, 0])
@@ -381,22 +440,22 @@ class VidODE2(nn.Module):
             nn.ReLU(True),
             nn.Conv2d(32, 4, 3, 1, 1)
         )
-
+        
     def init(self, input): # input, h, start
         b,c,h,w = input.shape
         return input, torch.zeros(b,64,h//4,w//4, device=input.device), input[:,:1]
 
     def forward(self, input, state, start):
         b,c,h,w = input.shape
-
+        
         prevstate = state.clone()
         if c > 1: # update state only if weather data present
             state = self.gate(self.encoder(input), state)
             start = input[:,:1]
-
+        
         state = self.node(state,)[0]
         outputs = self.decoder(torch.cat((state, prevstate), 1))
-
+        
         # warp params
         flow = outputs[:,:2].permute(0,2,3,1)
         grid_x = torch.linspace(-1.0, 1.0, w).view(1,1,w,1).expand(b,h,-1,-1)
@@ -408,11 +467,11 @@ class VidODE2(nn.Module):
         conv_pred, mask = outputs[:,[2]], torch.sigmoid(outputs[:,[3]])
         return warp_pred*mask + conv_pred*(1-mask), state, start
 
-
+        
 class IAM(Seq2seq):
     def __init__(self, c, w_w=9, i_w=0, e_w=3, **kwargs) -> None:
         super().__init__(
-            model=IAM4VP((1+w_w+i_w,c,64,64)),
+            model=IAM4VP((1+w_w+i_w,c,64,64)), 
             w_w=w_w, i_w=i_w, e_w=e_w, **kwargs)
 
     def forward(self, inputs):
@@ -425,28 +484,28 @@ class IAM(Seq2seq):
         return torch.stack(loss_pred_list, 1)[:,:,0]
 
 class VFN(Seq2seq):
-    def __init__(self, c, mode='bilinear', align_korners=True, w_w=7, i_w=0, e_w=3, **kwargs) -> None:
+    def __init__(self, c, scales=None, mode='bilinear', align_korners=True, w_w=7, i_w=0, e_w=3, **kwargs) -> None:
         super().__init__(
-            model=DMVFN(c, mode, align_korners),
+            model=DMVFN(c, scales, mode, align_korners), 
             w_w=w_w, i_w=i_w, e_w=e_w, **kwargs)
-
+        
     def forward(self, inputs):
         """inputs shape BTCHW"""
         m1 = inputs[:, 0]
         m2 = self.ingate(inputs[:, 1], inputs[:, 0])
-
+        
         # warm
         for i in range(1, self.w_w):
             m1, m2 = m2, self.model(torch.cat((m1, m2), 1))
             m2 = self.ingate(inputs[:, 1 + i], m2 if not self.training else m2[-1])
-
+        
         outputs = []
         # interpolate
         for i in range(self.i_w):
             m1, m2 = m2, self.model(torch.cat((m1, m2), 1))
             outputs.append(self.outgate(m2)[...,0,:,:])
             m2 = self.ingate(inputs[:, 1 + i], m2 if not self.training else m2[-1])
-
+            
         # extrapolate
         for i in range(self.e_w):
             m1, m2 = m2, self.model(torch.cat((m1, m2), 1))
